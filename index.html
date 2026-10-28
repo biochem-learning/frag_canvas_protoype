@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fragment Canvas</title>
+<link rel="stylesheet" href="libs/ChemDoodleWeb.css">
+<style>
+:root { --border-setting: 1px solid black; }
+body { margin: 0; padding: 24px; font-family: Arial, sans-serif; background: #2d3748; }
+button { font: inherit; }
+.user-section { position: relative; width: min(100%, 800px); height: min(720px, calc(100dvh - 48px)); min-height: 360px; margin: auto; overflow: auto; border: var(--border-setting); border-radius: 10px; background: aliceblue; }
+.u-s-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px; }
+.u-s-name { margin: 0; font-size: 16px; font-weight: normal; }
+.frag-table-button { padding: 8px 12px; border: var(--border-setting); border-radius: 10px; cursor: pointer; }
+.frag-table { display: none; position: absolute; z-index: 2; top: 90px; right: 10px; width: min(340px, calc(100% - 36px)); max-height: calc(100% - 130px); overflow-y: auto; border-radius: 10px; padding: 8px; background: rgba(3, 79, 212, .85); }
+.f-t-general-instr { text-align: center; color: white; padding: 5px; font-size: 14px; }
+@media (max-width: 480px) { body { padding: 10px; } .user-section { height: calc(100dvh - 22px); } }
+
+#frag-canvas { width: 100%; min-height: 160px; }
+#fragment-editor { display: block; padding: 0; border: 0; touch-action: none; }
+#fragment-editor:focus-visible { outline: 2px solid #2563eb; outline-offset: -2px; }
+.fragment-controls { display: flex; gap: 6px; padding: 4px 8px; }
+.fragment-controls button { cursor: pointer; border: var(--border-setting); border-radius: 6px; padding: 4px 10px; }
+.fragment-controls #del-frag-button { width: auto; }
+.fragment-controls button[aria-pressed="true"] { background: #dbeafe; }
+.fragment-controls button:disabled { cursor: default; opacity: .5; }
+#fragment-status { color: #424b5a; font-size: 12px; line-height: 1.4; margin: 3px 8px 6px; }
+.frag-table .fragment-choice { display: inline-flex; justify-content: center; align-items: center; width: 29%; height: 72px; margin: 2%; padding: 4px; border: 1px solid transparent; border-radius: 6px; background: aliceblue; cursor: pointer; vertical-align: middle; }
+.frag-table .fragment-choice:hover, .frag-table .fragment-choice:focus-visible { border-color: #2563eb; background: #dbeafe; }
+.frag-table .fragment-choice svg { width: auto; height: auto; max-width: 90%; max-height: 60px; padding: 0; pointer-events: none; }
+
+.frag-table .fragment-choice { box-sizing: border-box; }
+</style>
+</head>
+<body>
+<main class="user-section" aria-label="Fragment workspace">
+    <div class="u-s-header">
+        <h1 class="u-s-name">Fragment Space</h1>
+        <button type="button" class="frag-table-button" aria-expanded="false" aria-controls="fragment-table">Open Fragment Table</button>
+    </div>
+    <div class="fragment-controls" role="toolbar" aria-label="Fragment controls">
+        <button type="button" id="del-frag-button" aria-pressed="false" disabled>Delete</button>
+        <button type="button" id="undo-frag-button" disabled>Undo</button>
+        <button type="button" id="clear-frag-button" disabled>Clear</button>
+    </div>
+    <div id="frag-canvas"><canvas id="fragment-editor" tabindex="0" aria-label="Fragment drawing canvas"></canvas></div>
+    <p id="fragment-status" role="status">Loading fragments…</p>
+    <div class="frag-table" id="fragment-table">
+        <div class="f-t-general-instr">Click on a fragment to add it to the Fragment Space</div>
+    </div>
+</main>
+<script src="libs/RDKit_minimal.js"></script>
+<script src="libs/ChemDoodleWeb.js"></script>
+<script src="libs/ChemDoodleWeb-uis.js"></script>
+<script>
+async function getData(path) {
+    const response = await fetch(path);
+    if (!response.ok) throw new Error("Could not load " + path + ": " + response.status);
+    return response.text();
+}
+const tableButton = document.querySelector(".frag-table-button");
+const fragmentTable = document.querySelector(".frag-table");
+function toggleFragmentTable(open) {
+    fragmentTable.style.display = open ? "block" : "none";
+    tableButton.textContent = (open ? "Close" : "Open") + " Fragment Table";
+    tableButton.setAttribute("aria-expanded", String(open));
+}
+tableButton.addEventListener("click", () => {
+    toggleFragmentTable(tableButton.getAttribute("aria-expanded") !== "true");
+});
+document.addEventListener("click", event => {
+    if (!event.target.closest(".frag-table, .frag-table-button")) toggleFragmentTable(false);
+});
+document.addEventListener("keydown", event => {
+    if (event.key === "Escape") toggleFragmentTable(false);
+});
+let RDKitLoader;
+function loadRDKit() {
+    if (!RDKitLoader) {
+        RDKitLoader = window.initRDKitModule().catch(error => {
+            RDKitLoader = null;
+            throw error;
+        });
+    }
+    return RDKitLoader;
+}
+
+const FRAGMENT_TEMPLATES = [
+    { name: "Carbon", smiles: "*C(*)(*)*" },
+    { name: "Oxygen", smiles: "*O*" },
+    { name: "Hydrogen", smiles: "[H]*" },
+    { name: "Chlorine", smiles: "Cl*" },
+    { name: "Bromine", smiles: "Br*" },
+    { name: "Carbonyl", smiles: "*C(*)=O" },
+    { name: "Nitrogen", smiles: "*N(*)*" },
+    { name: "Alkene", smiles: "*C(*)=C(*)*" },
+    { name: "Benzene", smiles: "*C1=C(*)C(*)=C(*)C(*)=C1*" }
+];
+
+async function createFragmentWorkspace() {
+    const host = document.querySelector("#frag-canvas");
+    const element = document.querySelector("#fragment-editor");
+    const status = document.querySelector("#fragment-status");
+    const deleteButton = document.querySelector("#del-frag-button");
+    const undoButton = document.querySelector("#undo-frag-button");
+    const clearButton = document.querySelector("#clear-frag-button");
+    const table = document.querySelector(".frag-table");
+    const hint = "Drag a structure to move it. Click two blue ends to connect them.";
+    const editor = new ChemDoodle.SketcherCanvas(element.id, Math.max(200, host.clientWidth), 240, {
+        includeToolbar: false, useServices: false, oneMolecule: false,
+        requireStartingAtom: false, resizable: false
+    });
+    editor.hideHelp = true;
+    editor.styles.backgroundColor = "aliceblue";
+    editor.styles.atoms_displayTerminalCarbonLabels_2D = false;
+    editor.styles.bondLength_2D = 28;
+    for (const event of ["click", "dblclick", "mousedown", "mousemove", "mouseup",
+        "mouseover", "mouseout", "rightclick", "rightmousedown", "rightmouseup",
+        "drag", "mousewheel", "keydown", "keypress", "keyup", "touchstart",
+        "touchmove", "touchend", "gesturechange", "gestureend"]) {
+        editor[event] = () => {};
+    }
+    let fragments = [], connections = [], history = [], selected = null;
+    let pendingPort = null, gesture = null, nextId = 1, deleteMode = false;
+    let renderedAtoms = [];
+    const snapshot = () => JSON.stringify({ fragments, connections, nextId });
+    function remember(before = snapshot()) {
+        history.push(before);
+        if (history.length > 100) history.shift();
+    }
+    function announce(message = hint) { status.textContent = message; }
+    function buildGraph() {
+        const graph = new ChemDoodle.structures.Molecule();
+        const atoms = new Map();
+        const used = new Set(connections.flatMap(link => [link.a, link.b]));
+        for (const fragment of fragments) {
+            fragment.atoms.forEach((data, index) => {
+                const key = fragment.id + ":" + index;
+                if (used.has(key)) return;
+                const atom = new ChemDoodle.structures.Atom(data.label, data.x, data.y);
+                atom.fragmentId = fragment.id;
+                atom.portKey = data.label === "*" ? key : null;
+                atoms.set(key, atom);
+                graph.atoms.push(atom);
+            });
+            for (const bond of fragment.bonds) {
+                const a = atoms.get(fragment.id + ":" + bond.a);
+                const b = atoms.get(fragment.id + ":" + bond.b);
+                if (a && b) graph.bonds.push(new ChemDoodle.structures.Bond(a, b, bond.order));
+            }
+        }
+        function anchor(key) {
+            const [id, index] = key.split(":").map(Number);
+            const fragment = fragments.find(item => item.id === id);
+            const bond = fragment.bonds.find(item => item.a === index || item.b === index);
+            return atoms.get(id + ":" + (bond.a === index ? bond.b : bond.a));
+        }
+        for (const link of connections) {
+            graph.bonds.push(new ChemDoodle.structures.Bond(anchor(link.a), anchor(link.b), 1));
+        }
+        return graph;
+    }
+    function render() {
+        const graph = buildGraph();
+        renderedAtoms = graph.atoms;
+        editor.molecules = new ChemDoodle.informatics.Splitter().split(graph);
+        editor.molecules.forEach(molecule => molecule.check());
+        editor.repaint();
+        undoButton.disabled = history.length === 0;
+        clearButton.disabled = fragments.length === 0;
+        deleteButton.disabled = fragments.length === 0;
+        deleteButton.setAttribute("aria-pressed", String(deleteMode));
+    }
+    const originalExtras = editor.drawChildExtras;
+    editor.drawChildExtras = function(ctx, styles) {
+        originalExtras.call(this, ctx, styles);
+        for (const atom of renderedAtoms) {
+            if (!atom.portKey && atom.fragmentId !== selected) continue;
+            ctx.beginPath();
+            ctx.arc(atom.x, atom.y, atom.portKey ? 7 : 5, 0, Math.PI * 2);
+            ctx.strokeStyle = atom.portKey === pendingPort ? "#dc7800" : atom.portKey ? "#2563eb" : "#7d8b9d";
+            ctx.lineWidth = atom.portKey === pendingPort ? 3 : 1.5;
+            ctx.stroke();
+        }
+        if (gesture && gesture.port && gesture.point) {
+            const start = renderedAtoms.find(atom => atom.portKey === gesture.port);
+            if (start) {
+                ctx.beginPath();
+                ctx.setLineDash([4, 4]);
+                ctx.moveTo(start.x, start.y);
+                ctx.lineTo(gesture.point.x, gesture.point.y);
+                ctx.strokeStyle = "#2563eb";
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+    };
+    function connectedIds(id) {
+        const ids = new Set([id]);
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const link of connections) {
+                const a = Number(link.a.split(":")[0]), b = Number(link.b.split(":")[0]);
+                if (ids.has(a) !== ids.has(b)) { ids.add(a); ids.add(b); changed = true; }
+            }
+        }
+        return ids;
+    }
+    function removeFragment(id) {
+        remember();
+        fragments = fragments.filter(fragment => fragment.id !== id);
+        connections = connections.filter(link => ![link.a, link.b].some(key => key.startsWith(id + ":")));
+        selected = pendingPort = null;
+        if (!fragments.length) deleteMode = false;
+        render();
+        announce("Fragment deleted. Undo restores it and its connections.");
+    }
+    const RDKit = await loadRDKit();
+    function connect(a, b) {
+        if (a === b) { pendingPort = null; render(); return; }
+        const before = snapshot();
+        const [aId, aIndex] = a.split(":").map(Number);
+        const [bId, bIndex] = b.split(":").map(Number);
+        const first = fragments.find(fragment => fragment.id === aId);
+        const second = fragments.find(fragment => fragment.id === bId);
+        function portAnchor(fragment, index) {
+            const bond = fragment.bonds.find(item => item.a === index || item.b === index);
+            return fragment.atoms[bond.a === index ? bond.b : bond.a];
+        }
+        if (!connectedIds(aId).has(bId)) {
+            const anchorA = portAnchor(first, aIndex), anchorB = portAnchor(second, bIndex);
+            const portA = first.atoms[aIndex], portB = second.atoms[bIndex];
+            const angleA = Math.atan2(portA.y-anchorA.y, portA.x-anchorA.x);
+            const angleB = Math.atan2(portB.y-anchorB.y, portB.x-anchorB.x);
+            const rotation = angleA + Math.PI - angleB;
+            const origin = { x: anchorB.x, y: anchorB.y };
+            const target = { x: anchorA.x + 28*Math.cos(angleA), y: anchorA.y + 28*Math.sin(angleA) };
+            const moving = connectedIds(bId);
+            for (const fragment of fragments) if (moving.has(fragment.id)) {
+                for (const atom of fragment.atoms) {
+                    const x = atom.x-origin.x, y = atom.y-origin.y;
+                    atom.x = target.x + x*Math.cos(rotation) - y*Math.sin(rotation);
+                    atom.y = target.y + x*Math.sin(rotation) + y*Math.cos(rotation);
+                }
+            }
+        }
+        connections.push({ a, b });
+        let molecule;
+        try {
+            const graph = buildGraph();
+            if (graph.bonds.some(bond => bond.a1 === bond.a2)) throw new Error("Choose ends on different atoms.");
+            const pairs = new Set();
+            for (const bond of graph.bonds) {
+                const key = [graph.atoms.indexOf(bond.a1), graph.atoms.indexOf(bond.a2)].sort((x,y) => x-y).join(":");
+                if (pairs.has(key)) throw new Error("Those atoms are already connected.");
+                pairs.add(key);
+            }
+            molecule = RDKit.get_mol(ChemDoodle.writeMOL(graph), JSON.stringify({ removeHs: false }));
+            if (!molecule || !molecule.is_valid()) throw new Error("These ends cannot form a valid bond.");
+            remember(before);
+            announce("Connected. Remaining blue ends can accept more fragments.");
+        } catch (error) {
+            const previous = JSON.parse(before);
+            fragments = previous.fragments;
+            connections = previous.connections;
+            announce(error.message || "Could not connect these fragments.");
+        } finally {
+            molecule?.delete();
+            pendingPort = null;
+            render();
+        }
+    }
+    function point(event) {
+        const rect = element.getBoundingClientRect();
+        return { x: (event.clientX - rect.left) * editor.width / rect.width,
+            y: (event.clientY - rect.top) * editor.height / rect.height };
+    }
+    function hit(p) {
+        let closest = null, distance = 15;
+        for (const atom of renderedAtoms) {
+            const d = Math.hypot(atom.x - p.x, atom.y - p.y);
+            if (d < distance) { closest = atom; distance = d; }
+        }
+        if (closest) return closest;
+        for (const molecule of editor.molecules) {
+            for (const bond of molecule.bonds) {
+                const dx = bond.a2.x - bond.a1.x, dy = bond.a2.y - bond.a1.y;
+                const t = Math.max(0, Math.min(1, ((p.x-bond.a1.x)*dx+(p.y-bond.a1.y)*dy)/(dx*dx+dy*dy || 1)));
+                if (Math.hypot(p.x-bond.a1.x-t*dx, p.y-bond.a1.y-t*dy) < 8) {
+                    return { fragmentId: bond.a1.fragmentId, portKey: null };
+                }
+            }
+        }
+        return null;
+    }
+    element.addEventListener("pointerdown", event => {
+        if (event.button !== 0 || gesture) return;
+        event.preventDefault();
+        element.focus();
+        const p = point(event), target = hit(p);
+        if (!target) { selected = pendingPort = null; render(); return; }
+        if (deleteMode) { removeFragment(target.fragmentId); return; }
+        selected = target.fragmentId;
+        gesture = { pointerId: event.pointerId, start: p, last: p, point: p,
+            port: target.portKey, ids: connectedIds(selected), before: snapshot(), moved: false };
+        element.setPointerCapture(event.pointerId);
+        render();
+    });
+    element.addEventListener("pointermove", event => {
+        if (!gesture || event.pointerId !== gesture.pointerId) return;
+        const p = point(event);
+        if (Math.hypot(p.x-gesture.start.x, p.y-gesture.start.y) > 4) gesture.moved = true;
+        if (gesture.moved && !gesture.port) {
+            for (const fragment of fragments) if (gesture.ids.has(fragment.id)) {
+                for (const atom of fragment.atoms) { atom.x += p.x-gesture.last.x; atom.y += p.y-gesture.last.y; }
+            }
+        }
+        gesture.last = gesture.point = p;
+        render();
+    });
+    function release(event, cancelled = false) {
+        if (!gesture || event.pointerId !== gesture.pointerId) return;
+        const current = gesture;
+        gesture = null;
+        if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+        if (cancelled) {
+            const previous = JSON.parse(current.before);
+            fragments = previous.fragments; connections = previous.connections;
+            pendingPort = null;
+        } else if (current.port) {
+            const target = hit(point(event));
+            if (current.moved) {
+                if (target?.portKey && target.portKey !== current.port) connect(current.port, target.portKey);
+                else announce("Drop on another blue end to connect.");
+            } else if (pendingPort) connect(pendingPort, current.port);
+            else { pendingPort = current.port; announce("Now click another blue end. Escape cancels."); }
+        } else if (current.moved) { remember(current.before); pendingPort = null; }
+        render();
+    }
+    element.addEventListener("pointerup", event => release(event));
+    element.addEventListener("pointercancel", event => release(event, true));
+    function undo() {
+        if (!history.length || gesture) return;
+        const previous = JSON.parse(history.pop());
+        fragments = previous.fragments; connections = previous.connections; nextId = previous.nextId;
+        selected = pendingPort = null; deleteMode = false;
+        render(); announce("Undone.");
+    }
+    deleteButton.addEventListener("click", () => {
+        if (selected !== null) { removeFragment(selected); return; }
+        deleteMode = !deleteMode; pendingPort = null;
+        render(); announce(deleteMode ? "Click a fragment to delete it." : hint);
+    });
+    undoButton.addEventListener("click", undo);
+    clearButton.addEventListener("click", () => {
+        if (!fragments.length) return;
+        remember(); fragments = []; connections = [];
+        selected = pendingPort = null; deleteMode = false;
+        render(); announce("Canvas cleared. Undo restores your work.");
+    });
+    element.addEventListener("keydown", event => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+            event.preventDefault(); undo();
+        } else if (event.key === "Delete" || event.key === "Backspace") {
+            event.preventDefault();
+            if (selected !== null) removeFragment(selected);
+        } else if (event.key === "Escape") {
+            pendingPort = selected = null; deleteMode = false; render(); announce();
+        }
+        event.stopPropagation();
+    });
+    const templates = await Promise.all(FRAGMENT_TEMPLATES.map(async (definition, index) => {
+        const svgText = await getData("data/frag-library/frag" + index + ".svg");
+        const svg = new DOMParser().parseFromString(svgText, "image/svg+xml").documentElement;
+        if (svg.localName !== "svg") throw new Error("Invalid fragment SVG.");
+        let molecule;
+        try {
+            molecule = RDKit.get_mol(definition.smiles, JSON.stringify({ removeHs: false }));
+            if (!molecule) throw new Error("Invalid fragment structure.");
+            const model = ChemDoodle.readMOL(molecule.get_molblock());
+            model.atoms.forEach(atom => { if (atom.label === "R") atom.label = "*"; });
+            model.scaleToAverageBondLength(28);
+            return { svg, model, name: definition.name };
+        } finally { molecule?.delete(); }
+    }));
+    for (const { svg, model, name } of templates) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "fragment-choice";
+        button.title = "Add " + name.toLowerCase() + " fragment";
+        button.setAttribute("aria-label", button.title);
+        button.appendChild(document.importNode(svg, true));
+        button.addEventListener("click", () => {
+            remember();
+            const center = model.getCenter();
+            const slot = fragments.length % 6;
+            const x = editor.width * (0.28 + (slot % 2) * 0.44);
+            const y = 60 + Math.floor(slot / 2) * Math.max(20, (editor.height - 120) / 2);
+            fragments.push({ id: nextId++, atoms: model.atoms.map(atom => ({
+                label: atom.label, x: atom.x-center.x+x, y: atom.y-center.y+y
+            })), bonds: model.bonds.map(bond => ({
+                a: model.atoms.indexOf(bond.a1), b: model.atoms.indexOf(bond.a2), order: bond.bondOrder
+            })) });
+            selected = nextId-1; pendingPort = null; deleteMode = false;
+            render(); announce(); element.focus();
+        });
+        table.appendChild(button);
+    }
+    function resize() {
+        const width = Math.max(100, host.clientWidth);
+        const section = host.closest(".user-section");
+        const height = Math.max(160, section.clientHeight -
+            section.querySelector(".u-s-header").offsetHeight -
+            section.querySelector(".fragment-controls").offsetHeight - status.offsetHeight - 12);
+        if (width !== editor.width || height !== editor.height) editor.resize(width, height);
+        render();
+    }
+    new ResizeObserver(resize).observe(host);
+    new ResizeObserver(resize).observe(host.closest(".user-section"));
+    resize(); announce();
+}
+
+createFragmentWorkspace().catch(error => {
+    console.error("Fragment workspace failed to load:", error);
+    document.querySelector("#fragment-status").textContent =
+        "Could not load the fragment editor. Reload the page to try again.";
+});
+
+
+</script>
+</body>
+</html>
